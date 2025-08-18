@@ -1,3 +1,4 @@
+# %%
 try:
     import cupy as cp
 
@@ -56,6 +57,21 @@ class CrossEntropy:
         return self.forward(logits, target)
 
 
+class ReLU:
+    def __init__(self):
+        self.input = None
+
+    def forward(self, x):
+        self.input = x
+        return cp.maximum(0, x)
+
+    def backward(self, grad):
+        return cp.where(self.input > 0, grad, 0)
+
+    def __call__(self, x):
+        return self.forward(x)
+
+
 class LeakyReLU:
     def __init__(self, alpha=0.1):
         self.alpha = alpha
@@ -67,6 +83,21 @@ class LeakyReLU:
 
     def backward(self, grad):
         return cp.where(self.input > 0, grad, self.alpha * grad)
+
+    def __call__(self, x):
+        return self.forward(x)
+
+
+class Sigmoid:
+    def __init__(self):
+        self.input = None
+
+    def forward(self, x):
+        self.input = x
+        return 1 / (1 + cp.exp(-x))
+
+    def backward(self, grad):
+        return grad * (1 - self.input) * self.input
 
     def __call__(self, x):
         return self.forward(x)
@@ -230,9 +261,6 @@ class DendriticLayer:
         n_neurons,
         n_dendrite_inputs,
         n_dendrites,
-        synaptic_resampling=True,
-        percentage_resample=0.25,
-        steps_to_resample=128,
     ):
         self.in_dim = in_dim
         self.n_dendrite_inputs = n_dendrite_inputs
@@ -240,14 +268,6 @@ class DendriticLayer:
         self.n_dendrites = n_dendrites
         self.n_soma_connections = n_dendrites * n_neurons
         self.n_synaptic_connections = n_dendrite_inputs * n_dendrites * n_neurons
-
-        # dynamicly resample
-        self.synaptic_resampling = synaptic_resampling
-        self.percentage_resample = percentage_resample
-        self.steps_to_resample = steps_to_resample
-        # to keep track of resampling
-        self.num_mask_updates = 1
-        self.update_steps = 0
 
         self.dendrite_W = cp.random.randn(self.n_soma_connections, in_dim) * cp.sqrt(
             2.0 / (in_dim)
@@ -324,165 +344,7 @@ class DendriticLayer:
         self.dendrite_db = soma_grad.sum(axis=0)
         dendrite_grad = soma_grad @ self.dendrite_W
 
-        self.update_steps += 1
-
-        # resample dendrites every steps_to_resample steps
-        if self.synaptic_resampling and self.update_steps >= self.steps_to_resample:
-            # reset step counter
-            self.update_steps = 0
-            self.resample_dendrites()
-
         return dendrite_grad
-
-    def resample_dendrites(self):
-        """
-        Implements synaptic resampling by replacing weak dendritic connections with new random ones.
-
-        This method mimics synaptic plasticity in biological neurons, where weak or unused
-        synaptic connections are pruned and replaced with new connections to explore different
-        input patterns. The resampling helps prevent overfitting and maintains exploration
-        capabilities during training.
-
-        Algorithm Overview:
-        1. **Connection Removal**: Identifies the weakest connections (lowest weight magnitude)
-           for removal based on `self.percentage_resample`
-        2. **One-shot Resampling**: Randomly samples new input connections for each removed connection
-        3. **Conflict Detection**: Checks for conflicts with existing connections and duplicate
-           assignments within the same dendrite
-        4. **Successful Swaps**: Applies only valid swaps that don't create conflicts
-        5. **Verification**: Ensures the dendritic structure integrity is maintained
-
-        The method operates efficiently by:
-        - Using vectorized operations for all dendrites simultaneously
-        - Implementing one-shot resampling rather than iterative attempts
-        - Only applying successful swaps to avoid invalid states
-        - Maintaining sparsity through the dendrite_mask
-
-        Side Effects:
-            - Updates self.dendrite_mask to reflect new connection patterns
-            - Reinitializes weights for new connections using He initialization
-            - Zeros out weights and gradients for removed connections
-            - Increments self.num_mask_updates counter
-
-        Raises:
-            AssertionError: If resampling violates dendritic structure constraints
-                - Each dendrite must maintain exactly n_dendrite_inputs connections
-                - Total active connections must equal n_synaptic_connections
-
-        Returns:
-            None: Method modifies the layer's state in-place
-
-        Note:
-            - Called automatically during backward pass if synaptic_resampling=True
-            - Early returns if percentage_resample results in 0 connections to remove
-            - Biologically inspired by synaptic pruning and neuroplasticity
-        """
-        # --- Part 1: Connection Removal ---
-        # calculate number of connections to remove per dendrite
-        n_to_remove_per_dendrite = int(
-            self.n_dendrite_inputs * self.percentage_resample
-        )
-        if n_to_remove_per_dendrite == 0:
-            return
-
-        num_dendrites = self.dendrite_mask.shape[0]
-
-        # The metric is the magnitude of the weights, removing the smallest.
-        metric = cp.abs(self.dendrite_W)
-        # Set inactive connections to infinity so they are not picked.
-        metric[self.dendrite_mask == 0] = cp.inf
-        # sort by magnitude
-        sorted_indices = cp.argsort(metric, axis=1)
-        # remove the smallest n_to_remove_per_dendrite connections per dendrite
-        cols_to_remove = sorted_indices[:, :n_to_remove_per_dendrite]
-
-        # Create corresponding row indices and flatten for the swap logic
-        # dummy array of dendrite indices shape (num_dendrites, 1)
-        rows_to_remove = cp.arange(num_dendrites)[:, cp.newaxis]
-        # dummy array of shape (num_dendrites , n_to_remove_per_dendrite), flattened
-        removed_dendrite_indices = rows_to_remove.repeat(
-            n_to_remove_per_dendrite, axis=1
-        ).flatten()
-        removed_input_indices = cols_to_remove.flatten()
-
-        # removed_input_indices, contins the indices of the inputs to remove/resample
-        # for each dendrite in a flattened array
-
-        # --- Part 2: One-shot Resampling Attempt ---
-        n_connections_to_resample = removed_dendrite_indices.size
-
-        # sample n_connections_to_resample new inputs between 0 and in_dim
-        newly_selected_input_indices = cp.random.randint(
-            0, self.in_dim, size=n_connections_to_resample, dtype=int
-        )  # shape (n_connections_to_resample, 1)
-
-        # --- Part 3: Conflict Detection ---
-        # check if new inputs are already existing in the same dendrite
-        conflict_with_existing = (
-            self.dendrite_mask[removed_dendrite_indices, newly_selected_input_indices]
-            == 1
-        )
-
-        # create flat indices of proposed new connections
-        # by multiplying dendrite index with in_dim and adding the input index,
-        # we get a unique index for each proposed new connection, in  the same dendrite
-        proposed_flat_indices = (
-            removed_dendrite_indices * self.in_dim + newly_selected_input_indices
-        )  # shape (n_connections_to_resample, 1)
-
-        # count number of occurences of each index
-        counts = cp.bincount(
-            proposed_flat_indices.astype(int),
-            minlength=num_dendrites * self.in_dim,
-        )  # shape (num_dendrites * in_dim, 1)
-
-        # check if index is duplicated, in the same dendrite
-        is_duplicate_flat = counts[proposed_flat_indices.astype(int)] > 1
-
-        # flag as problematic if either conflict or duplicate
-        is_problematic = conflict_with_existing | is_duplicate_flat
-        # flag as successful if not problematic
-        is_successful = ~is_problematic
-
-        # --- Part 4: Apply Successful Swaps ---
-        dendrites_to_swap = removed_dendrite_indices[is_successful]
-
-        # if no successful swaps, return
-        if dendrites_to_swap.size == 0:
-            return
-
-        # get indices of old and new inputs to remove and add
-        old_inputs_to_remove = removed_input_indices[is_successful]
-        new_inputs_to_add = newly_selected_input_indices[is_successful]
-
-        # Update mask: remove old connections and add new ones
-        self.dendrite_mask[dendrites_to_swap, old_inputs_to_remove] = 0
-        self.dendrite_mask[dendrites_to_swap, new_inputs_to_add] = 1
-
-        # Initialize new weights with He initialization
-        self.dendrite_W[dendrites_to_swap, new_inputs_to_add] = cp.random.randn(
-            dendrites_to_swap.shape[0]
-        ) * cp.sqrt(2.0 / self.in_dim)
-
-        # Apply mask to ensure only active connections have non-zero weights
-        self.dendrite_W = self.dendrite_W * self.dendrite_mask
-        # Also zero out gradients for removed connections
-        self.dendrite_dW = self.dendrite_dW * self.dendrite_mask
-
-        # print(f"num of dendrite successful swaps: {dendrites_to_swap.size}")
-
-        self.num_mask_updates += 1
-
-        # --- Part 5: Verification ---
-        n_dendritic_mask_connections = cp.sum(self.dendrite_mask, axis=1)
-        assert cp.all(n_dendritic_mask_connections == self.n_dendrite_inputs), (
-            f"Resampling failed: not all dendrites have {self.n_dendrite_inputs} connections per dendrite."
-        )
-        assert (
-            cp.sum(cp.count_nonzero(self.dendrite_W)) == self.n_synaptic_connections
-        ), (
-            f"Resampling failed: not all dendrites have {self.n_synaptic_connections} connections in total."
-        )
 
     def num_params(self):
         print(
@@ -687,37 +549,33 @@ def evaluate(
     return float(normalised_test_loss), float(accuracy)
 
 
+# %%
+
 # for repoducability
-cp.random.seed(1287311233)
+cp.random.seed(1287305233)
 
 # data config
-dataset = "fashion-mnist"  # "mnist", "fashion-mnist"
+dataset = "mnist"  # "mnist", "fashion-mnist"
 
 # config
-n_epochs = 20  # 15 MNIST, 20 Fashion-MNIST
-lr = 0.001  # 0.002
-v_lr = 0.001  # 0.002
-b_lr = 0.001  # 0.002
-batch_size = 128
+n_epochs = 5  # 15 MNIST, 20 Fashion-MNIST
+lr_1 = 0.001  # 0.002
+lr_2 = 0.001  # 0.002
+batch_size = 32
 
 in_dim = 28 * 28  # Image dimensions (28x28 MNIST)
 n_classes = 10
 
 # dendritic model config
-n_dendrite_inputs = 32  # 32
-n_dendrites = 23  # 23
-n_neurons = 10  # 10
+n_dendrite_inputs = 8  # 32 / 16
+n_dendrites = 4  # 23 / 31
+n_neurons = 10  # 10 / 14
 
 # vanilla model config
 hidden_dim = 10  # 10
 
-model_name_1 = "Synaptic Resampling"
-model_name_2 = "Base Dendritic"
-model_name_3 = "Vanilla ANN"
 
-criterion = CrossEntropy()
-
-# new model with synaptic resampling
+# Sparse Dendritic Model, 3 layers
 model_1 = Sequential(
     [
         DendriticLayer(
@@ -725,30 +583,14 @@ model_1 = Sequential(
             n_neurons,
             n_dendrite_inputs=n_dendrite_inputs,
             n_dendrites=n_dendrites,
-            synaptic_resampling=True,
-            percentage_resample=0.1,  # 0.5
-            steps_to_resample=128,  # 128
         ),
-        LeakyReLU(),
-        LinearLayer(n_neurons, n_classes),
+        # LeakyReLU(),
+        # LinearLayer(n_neurons, n_classes),
     ]
 )
-# baseline dendritic model without synaptic resampling
+
+# Base MLP model, 3 layers
 model_2 = Sequential(
-    [
-        DendriticLayer(
-            in_dim,
-            n_neurons,
-            n_dendrite_inputs=n_dendrite_inputs,
-            n_dendrites=n_dendrites,
-            synaptic_resampling=False,
-        ),
-        LeakyReLU(),
-        LinearLayer(n_neurons, n_classes),
-    ]
-)
-# vanilla ANN model
-model_3 = Sequential(
     [
         LinearLayer(in_dim, hidden_dim),
         LeakyReLU(),
@@ -757,99 +599,133 @@ model_3 = Sequential(
         LinearLayer(hidden_dim, n_classes),
     ]
 )
-optimiser_1 = Adam(model_1.params(), lr=lr)
-optimiser_2 = Adam(model_2.params(), lr=b_lr)
-optimiser_3 = Adam(model_3.params(), lr=v_lr)
+optimiser_1 = Adam(model_1.params(), lr=lr_1)
+optimiser_2 = Adam(model_2.params(), lr=lr_2)
 
 print(f"number of model_1 params: {model_1.num_params()}")
 print(f"number of model_2 params: {model_2.num_params()}")
-print(f"number of model_3 params: {model_3.num_params()}")
 
-# Calculate eigenvalues at the beginning (before training)
-print("\n" + "=" * 50)
-print("EIGENVALUES AT THE BEGINNING (BEFORE TRAINING)")
-print("=" * 50)
+config = [
+    {
+        "name": "Sparse Dendritic",
+        "model": model_1,
+        "optimiser": optimiser_1,
+        "lr": lr_1,
+    },
+    #     {
+    #         "name": "Base MLP",
+    #         "model": model_2,
+    #         "optimiser": optimiser_2,
+    #         "lr": lr_2,
+    #     },
+]
+
+criterion = CrossEntropy()
 
 # load data
 X_train, y_train, X_test, y_test = load_mnist_data(dataset=dataset)
 
-print(f"Training {model_name_1} model...")
-train_losses_1, train_accuracy_1, test_losses_1, test_accuracy_1 = train(
-    X_train,
-    y_train,
-    X_test,
-    y_test,
-    model_1,
-    criterion,
-    optimiser_1,
-    n_epochs,
-    batch_size,
-)
-print(f"train accuracy {model_name_1} model {round(train_accuracy_1[-1] * 100, 1)}%")
-print(f"test accuracy {model_name_1} model {round(test_accuracy_1[-1] * 100, 1)}%")
+# Define colors for plotting
+colors = [
+    "green",
+    "blue",
+    "red",
+    "orange",
+    "purple",
+    "brown",
+    "pink",
+    "gray",
+    "olive",
+    "cyan",
+]
 
-print(f"Training {model_name_2} model...")
-train_losses_2, train_accuracy_2, test_losses_2, test_accuracy_2 = train(
-    X_train,
-    y_train,
-    X_test,
-    y_test,
-    model_2,
-    criterion,
-    optimiser_2,
-    n_epochs,
-    batch_size,
-)
+# Train all models in config
+results = []
+for i, model_config in enumerate(config):
+    model_name = model_config["name"]
+    model = model_config["model"]
+    optimiser = model_config["optimiser"]
 
-print(f"Training {model_name_3} model...")
-train_losses_3, train_accuracy_3, test_losses_3, test_accuracy_3 = train(
-    X_train,
-    y_train,
-    X_test,
-    y_test,
-    model_3,
-    criterion,
-    optimiser_3,
-    n_epochs,
-    batch_size,
-)
+    print(f"Training {model_name} model...")
+    train_losses, train_accuracy, test_losses, test_accuracy = train(
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        model,
+        criterion,
+        optimiser,
+        n_epochs,
+        batch_size,
+    )
 
-# Calculate eigenvalues at the end (after training)
-print("\n" + "=" * 50)
-print("EIGENVALUES AT THE END (AFTER TRAINING)")
-print("=" * 50)
+    # Store results
+    results.append(
+        {
+            "name": model_name,
+            "train_losses": train_losses,
+            "train_accuracy": train_accuracy,
+            "test_losses": test_losses,
+            "test_accuracy": test_accuracy,
+            "color": colors[i % len(colors)],
+        }
+    )
 
-# plot accuracy of vanilla model vs dendritic model
-plt.plot(train_accuracy_1, label=f"{model_name_1} Train", color="green", linestyle="--")
-plt.plot(train_accuracy_2, label=f"{model_name_2} Train", color="blue", linestyle="--")
-plt.plot(train_accuracy_3, label=f"{model_name_3} Train", color="red", linestyle="--")
-plt.plot(test_accuracy_1, label=f"{model_name_1} Test", color="green")
-plt.plot(test_accuracy_2, label=f"{model_name_2} Test", color="blue")
-plt.plot(test_accuracy_3, label=f"{model_name_3} Test", color="red")
+    print(f"Train accuracy {model_name}: {round(train_accuracy[-1] * 100, 1)}%")
+    print(f"Test accuracy {model_name}: {round(test_accuracy[-1] * 100, 1)}%")
+    print(f"Final train loss {model_name}: {round(train_losses[-1], 4)}")
+    print(f"Final test loss {model_name}: {round(test_losses[-1], 4)}")
+    print("-" * 50)
+
+# Plot accuracy comparison
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+for result in results:
+    plt.plot(
+        result["train_accuracy"],
+        label=f"{result['name']} Train",
+        color=result["color"],
+        linestyle="--",
+    )
+    plt.plot(
+        result["test_accuracy"], label=f"{result['name']} Test", color=result["color"]
+    )
 plt.title("Accuracy over epochs")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
 plt.legend()
-plt.show()
+plt.grid(True, alpha=0.3)
 
-# plot both models in comparison
-plt.plot(train_losses_1, label=f"{model_name_1} Train", color="green", linestyle="--")
-plt.plot(train_losses_2, label=f"{model_name_2} Train", color="blue", linestyle="--")
-plt.plot(train_losses_3, label=f"{model_name_3} Train", color="red", linestyle="--")
-plt.plot(test_losses_1, label=f"{model_name_1} Test", color="green")
-plt.plot(test_losses_2, label=f"{model_name_2} Test", color="blue")
-plt.plot(test_losses_3, label=f"{model_name_3} Test", color="red")
+# Plot loss comparison
+plt.subplot(1, 2, 2)
+for result in results:
+    plt.plot(
+        result["train_losses"],
+        label=f"{result['name']} Train",
+        color=result["color"],
+        linestyle="--",
+    )
+    plt.plot(
+        result["test_losses"], label=f"{result['name']} Test", color=result["color"]
+    )
 plt.title("Loss over epochs")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
 plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
 
-print(
-    f"train loss {model_name_1} model {round(train_losses_1[-1], 4)} vs {model_name_2} {round(train_losses_2[-1], 4)} vs {model_name_3} {round(train_losses_3[-1], 4)}"
-)
-print(
-    f"test loss {model_name_1} model {round(test_losses_1[-1], 4)} vs {model_name_2} {round(test_losses_2[-1], 4)} vs {model_name_3} {round(test_losses_3[-1], 4)}"
-)
-print(
-    f"train accuracy {model_name_1} model {round(train_accuracy_1[-1] * 100, 1)}% vs {model_name_2} {round(train_accuracy_2[-1] * 100, 1)}% vs {model_name_3} {round(train_accuracy_3[-1] * 100, 1)}%"
-)
-print(
-    f"test accuracy {model_name_1} model {round(test_accuracy_1[-1] * 100, 1)}% vs {model_name_2} {round(test_accuracy_2[-1] * 100, 1)}% vs {model_name_3} {round(test_accuracy_3[-1] * 100, 1)}%"
-)
+# Print final comparison summary
+print("\n" + "=" * 60)
+print("FINAL RESULTS COMPARISON")
+print("=" * 60)
+for result in results:
+    print(
+        f"{result['name']:20} | Train Acc: {result['train_accuracy'][-1] * 100:5.1f}% | "
+        f"Test Acc: {result['test_accuracy'][-1] * 100:5.1f}% | "
+        f"Train Loss: {result['train_losses'][-1]:6.4f} | "
+        f"Test Loss: {result['test_losses'][-1]:6.4f}"
+    )
+print("=" * 60)
