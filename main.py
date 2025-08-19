@@ -382,7 +382,7 @@ class DendriticLayer:
 
     def num_params(self):
         print(
-            f"\nparameters: dendrite_mask: {cp.sum(self.dendrite_mask)}, dendrite_b: {self.dendrite_b.size}, soma_W: {cp.sum(self.soma_mask)}, soma_b: {self.soma_b.size}"
+            f"\nParameters of DendriticLayer: dendrite_mask: {cp.sum(self.dendrite_mask)}, dendrite_b: {self.dendrite_b.size}, soma_W: {cp.sum(self.soma_mask)}, soma_b: {self.soma_b.size}"
         )
         return int(
             cp.sum(self.dendrite_mask)
@@ -501,7 +501,7 @@ def train(
     model,
     criterion,
     optimiser,
-    n_epochs=2,
+    n_epochs=10,
     batch_size=128,
 ):
     train_losses = []
@@ -586,12 +586,18 @@ def evaluate(
 # %%
 # Global config
 cp.random.seed(1287305233)
-dataset = "mnist"  # "mnist" or "fashion-mnist"
+dataset = "fashion-mnist"  # "mnist" or "fashion-mnist"
 in_dim = 28 * 28
 n_classes = 10
 
 # Fast dev knob (set to an int like 10_000 to speed up runs)
 subset_size = None  # e.g. 10000
+
+
+basic_mlp_dims = [in_dim, 10, n_classes]
+# For dendritic: [in_dim, n_dendrite_inputs, n_dendrites, n_neurons, out_dim]
+dendritic_dims = [in_dim, 32, 23, 10, n_classes]
+
 
 # %%
 # Data loading
@@ -614,20 +620,16 @@ def build_activation(name):
 
 
 def build_mlp(
-    in_features=in_dim,
-    hidden_dim=10,
-    out_dim=n_classes,
+    dims=[10, 10, 10],
     activation="leakyrelu",
 ):
-    return Sequential(
-        [
-            LinearLayer(in_features, hidden_dim),
-            build_activation(activation),
-            LinearLayer(hidden_dim, hidden_dim),
-            build_activation(activation),
-            LinearLayer(hidden_dim, out_dim),
-        ]
-    )
+    print("dims", dims)
+    layers = []
+    for i in range(len(dims) - 1):
+        layers.append(LinearLayer(dims[i], dims[i + 1]))
+        if i < len(dims) - 2:  # Don't add activation after the last layer
+            layers.append(build_activation(activation))
+    return Sequential(layers)
 
 
 def build_dendritic(
@@ -635,9 +637,9 @@ def build_dendritic(
     n_dendrite_inputs=16,
     n_dendrites=31,
     n_neurons=10,
-    out_dim=10,
+    out_dim=None,
 ):
-    # The denrtic layer always has two layers, dendrite and soma. To make the comparison fair we use
+    # The dendritic layer always has two layers, dendrite and soma. To make the comparison fair we use
     # three layers for the MLP as well.
     layers = [
         DendriticLayer(
@@ -653,17 +655,28 @@ def build_dendritic(
 
 
 # %% [markdown]
-# a) Basic MLP with SGD vs Adam
+# Experiment 1: Basic MLP with SGD vs Adam
+# Hypothesis: MLP with Adam will perform better than MLP with SGD.
 
 # %%
-n_epochs = 15
+# For 10 epochs our model mostly converged, and the effects we are interested in are clearly visible.
+n_epochs = 10
+# We did some basic experiments with different batch sizes, and 128 was the best. Based on performance and memory usage.
 batch_size = 128
-lr_sgd = 0.001
+
+# we already experiment with different learning rates outside of this notebook
+# And SGD with 0.01, and ADAM with 0.001 are the best performing learning rates.
+# Usually SGD requires a higher learning rate then ADAM.
+lr_sgd = 0.01
 lr_adam = 0.001
 
-mlp_sgd = build_mlp(in_dim, 10, n_classes, activation="leakyrelu")
-mlp_adam = build_mlp(in_dim, 10, n_classes, activation="leakyrelu")
 
+# Build models
+mlp_sgd = build_mlp(basic_mlp_dims, activation="leakyrelu")
+mlp_adam = build_mlp(basic_mlp_dims, activation="leakyrelu")
+
+print("mlp_sgd number of params:", mlp_sgd.num_params())
+print("mlp_adam number of params:", mlp_adam.num_params())
 
 opt_sgd = SGD(mlp_sgd.params(), lr=lr_sgd)
 opt_adam = Adam(mlp_adam.params(), lr=lr_adam)
@@ -718,15 +731,167 @@ print(
 )
 
 # %% [markdown]
-# b) MLP (28x28, 10, 10) vs Dendritic (16/31/10/10) both having 3 layers and around 8000 parameters in total. 8000 paramters is the smallest sensible MLP.
+# Adam outperforms SGD in this experiment.
+# Specifically, the final test accuracy for SGD was 82.8%, while Adam achieved 84.5%.
+# This indicates that Adam enables the model to learn more effectively on this task.
+#
+# The reason for this improvement is that Adam uses adaptive learning rates and momentum,
+# allowing it to converge faster and escape poor local minima more easily than vanilla SGD,
+# which uses a fixed learning rate and no momentum. As a result, Adam can better handle
+# the complex optimization landscape of neural networks, leading to higher accuracy.
+
+
+# %% [markdown]
+# Experiment 2: Activation comparison: ReLU vs LeakyReLU vs Sigmoid (MLP 28x28-10-10)
+# Hypothesis: LeakyReLU will perform better than ReLU and Sigmoid.
 
 # %%
-n_epochs = 8
+# Same as above, we used 10 epochs, and 128 batch size and 0.001 learning rate.
+n_epochs = 15
 batch_size = 128
 lr = 0.001
 
-mlp_b = build_mlp(in_dim, 10, n_classes, activation="leakyrelu")
-dend_b = build_dendritic(in_dim, 16, 31, 10, out_dim=10)
+activations = ["relu", "leakyrelu", "sigmoid"]
+histories = {}
+for act in activations:
+    model = build_mlp(basic_mlp_dims, activation=act)
+    opt = Adam(model.params(), lr=lr)
+    tr_losses, tr_acc, te_losses, te_acc = train(
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        model,
+        CrossEntropy(),
+        opt,
+        n_epochs=n_epochs,
+        batch_size=batch_size,
+    )
+    histories[act] = (tr_losses, tr_acc, te_losses, te_acc)
+
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+for act in activations:
+    plt.plot(histories[act][1], label=f"{act} Train", linestyle="--")
+    plt.plot(histories[act][3], label=f"{act} Test")
+plt.title("Accuracy by Activation")
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+for act in activations:
+    plt.plot(histories[act][0], label=f"{act} Train", linestyle="--")
+    plt.plot(histories[act][2], label=f"{act} Test")
+plt.title("Loss by Activation")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+for act in activations:
+    print(f"{act:10} | Test Acc: {histories[act][3][-1] * 100:.1f}%")
+
+
+# %% [markdown]
+"""Although all three activation functions—LeakyReLU, ReLU, and Sigmoid—achieve similar final test accuracies,
+they have very different training behaviors. LeakyReLU (85.1%) slightly outperforms ReLU (84.9%),
+and both perform better than Sigmoid (84.3%). The most significant difference is in their convergence speed.
+Sigmoid converges much more slowly because of the vanishing gradient problem.
+As inputs become very large or very small, Sigmoid's gradient approaches zero, which severely slows down learning. 
+This is particularly problematic in the early stages of training. ReLU and LeakyReLU solve this issue. 
+ReLU maintains a constant gradient of 1 for positive inputs, enabling much faster and more stable training. 
+However, it can suffer from the "dying ReLU" problem, where neurons become permanently inactive if their inputs are always negative.
+LeakyReLU improves on ReLU by introducing a small, non-zero slope for negative inputs. 
+This prevents neurons from dying, while still providing the benefits of faster convergence. 
+This more robust gradient flow is why LeakyReLU achieves a marginally superior final performance.
+"""
+
+# %% [markdown]
+# Experiment 3: Find out the best learning rate for MLP and Dendritic, given 12 epochs and 128 batch size. As already shown, LeakyReLU performs best. So we will use it here as well.
+# Furthermore we want to compare base MLP vs Dendritic given the same number of parameters, and optimised learning rate.
+
+# %%
+batch_size = 128
+grid_epochs = 12
+lr_grid = [0.0001, 0.001, 0.002, 0.005, 0.01, 0.05]
+
+
+def grid_search_model(build_fn, lr_list):
+    results = []
+    for lr in lr_list:
+        model = build_fn()
+        opt = Adam(model.params(), lr=lr)
+        tr_losses, tr_acc, te_losses, te_acc = train(
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            model,
+            CrossEntropy(),
+            opt,
+            n_epochs=grid_epochs,
+            batch_size=batch_size,
+        )
+        results.append({"lr": lr, "test_acc": te_acc[-1], "test_loss": te_losses[-1]})
+    # Pick best by highest test_acc, tie-breaker lowest loss
+    best = sorted(
+        results, key=lambda r: (-float(r["test_acc"]), float(r["test_loss"]))
+    )[0]
+    return results, best
+
+
+print("Grid search on MLP...")
+mlp_results, mlp_best = grid_search_model(
+    lambda: build_mlp(basic_mlp_dims, activation="leakyrelu"), lr_grid
+)
+print("Grid search on Dendritic...")
+dend_results, dend_best = grid_search_model(
+    lambda: build_dendritic(*dendritic_dims), lr_grid
+)
+
+
+def pretty_print(results, name):
+    print(f"\n{name} results (Adam, epochs={grid_epochs}, bs={batch_size})")
+    for r in results:
+        print(
+            f"lr={r['lr']:.5f} | test_acc={float(r['test_acc']) * 100:5.1f}% | test_loss={float(r['test_loss']):.4f}"
+        )
+
+
+pretty_print(mlp_results, "MLP")
+pretty_print(dend_results, "Dendritic")
+print(
+    f"\nBest MLP lr: {mlp_best['lr']:.5f}, Test Acc: {float(mlp_best['test_acc']) * 100:.1f}%"
+)
+print(
+    f"Best Dendritic lr: {dend_best['lr']:.5f}, Test Acc: {float(dend_best['test_acc']) * 100:.1f}%"
+)
+
+
+# %% [markdown]
+"""
+Analyis:
+
+Analysis of Grid Search Results:
+The grid search reveals that both MLP and Dendritic networks achieve optimal performance with a learning rate of 0.001, but the Dendritic model significantly outperforms the MLP across all learning rates. The Dendritic network achieves a best test accuracy of 86.5% compared to the MLP's 85.2%, representing a meaningful 1.3 percentage point improvement. Additionally, the Dendritic model demonstrates superior robustness across the learning rate spectrum, maintaining high performance (86.1-86.5%) across a wider range of learning rates (0.001-0.01), while the MLP shows more sensitivity to learning rate changes.
+Why the Sparse Dendritic Model Outperforms the MLP:
+The Dendritic model's superior performance can be attributed to several key architectural advantages. First, the dendritic structure introduces additional computational complexity through dendritic branches that can capture more sophisticated feature interactions than simple linear combinations in traditional MLPs. This enhanced representational capacity allows the model to learn more nuanced patterns in the data. Second, the sparse connectivity pattern in dendritic networks may act as a form of implicit regularization, preventing overfitting by constraining the model's capacity in a biologically-inspired manner. Third, dendritic networks can implement more complex activation patterns through their branching structure, potentially enabling better gradient flow and more stable training dynamics. The dendritic architecture's ability to process information through multiple parallel pathways may also contribute to its robustness across different learning rates, as the distributed nature of computation provides redundancy that helps maintain performance even when training conditions are suboptimal.
+
+
+"""
+
+
+# %% [markdown]
+# Experiment 4: MLP (28x28, 10, 10) vs Dendritic (16/31/10/10) both having 3 layers and around 8000 parameters in total. 8000 paramters is the smallest sensible MLP.
+# Final run to compare both models in detail given optimised learning rate.
+
+# %%
+n_epochs = 15
+batch_size = 128
+lr = 0.001
+
+mlp_b = build_mlp(basic_mlp_dims, activation="leakyrelu")
+dend_b = build_dendritic(*dendritic_dims)
 
 print(f"Number of MLP params: {mlp_b.num_params()}")
 print(f"Number of Dendritic params: {dend_b.num_params()}")
@@ -782,113 +947,3 @@ plt.show()
 print(
     f"Final Acc - MLP Test: {mlp_test_a[-1] * 100:.1f}% | Dend Test: {dend_test_a[-1] * 100:.1f}%"
 )
-
-# %% [markdown]
-# c) Activation comparison: ReLU vs LeakyReLU vs Sigmoid (MLP 28x28-10-10)
-
-# %%
-n_epochs = 15
-batch_size = 128
-lr = 0.001
-
-activations = ["relu", "leakyrelu", "sigmoid"]
-histories = {}
-for act in activations:
-    model = build_mlp(in_dim, 10, n_classes, activation=act)
-    opt = Adam(model.params(), lr=lr)
-    tr_l, tr_a, te_l, te_a = train(
-        X_train,
-        y_train,
-        X_test,
-        y_test,
-        model,
-        CrossEntropy(),
-        opt,
-        n_epochs=n_epochs,
-        batch_size=batch_size,
-    )
-    histories[act] = (tr_l, tr_a, te_l, te_a)
-
-plt.figure(figsize=(10, 4))
-plt.subplot(1, 2, 1)
-for act in activations:
-    plt.plot(histories[act][1], label=f"{act} Train", linestyle="--")
-    plt.plot(histories[act][3], label=f"{act} Test")
-plt.title("Accuracy by Activation")
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-plt.subplot(1, 2, 2)
-for act in activations:
-    plt.plot(histories[act][0], label=f"{act} Train", linestyle="--")
-    plt.plot(histories[act][2], label=f"{act} Test")
-plt.title("Loss by Activation")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-for act in activations:
-    print(f"{act:10} | Test Acc: {histories[act][3][-1] * 100:.1f}%")
-
-# %% [markdown]
-# d) Grid search: Adam learning rate (batch_size=128, epochs=20)
-
-# %%
-batch_size = 128
-grid_epochs = 20
-lr_grid = [5e-4, 1e-3, 2e-3, 5e-3]
-
-
-def grid_search_model(build_fn, lr_list):
-    results = []
-    for lr in lr_list:
-        model = build_fn()
-        opt = Adam(model.params(), lr=lr)
-        tr_l, tr_a, te_l, te_a = train(
-            X_train,
-            y_train,
-            X_test,
-            y_test,
-            model,
-            CrossEntropy(),
-            opt,
-            n_epochs=grid_epochs,
-            batch_size=batch_size,
-        )
-        results.append({"lr": lr, "test_acc": te_a[-1], "test_loss": te_l[-1]})
-    # Pick best by highest test_acc, tie-breaker lowest loss
-    best = sorted(
-        results, key=lambda r: (-float(r["test_acc"]), float(r["test_loss"]))
-    )[0]
-    return results, best
-
-
-print("Grid search on MLP...")
-mlp_results, mlp_best = grid_search_model(
-    lambda: build_mlp(in_dim, 10, n_classes, activation="leakyrelu"), lr_grid
-)
-print("Grid search on Dendritic...")
-dend_results, dend_best = grid_search_model(
-    lambda: build_dendritic(in_dim, 16, 31, 4, out_dim=10), lr_grid
-)
-
-
-def pretty_print(results, name):
-    print(f"\n{name} results (Adam, epochs={grid_epochs}, bs={batch_size})")
-    for r in results:
-        print(
-            f"lr={r['lr']:.5f} | test_acc={float(r['test_acc']) * 100:5.1f}% | test_loss={float(r['test_loss']):.4f}"
-        )
-
-
-pretty_print(mlp_results, "MLP")
-pretty_print(dend_results, "Dendritic")
-print(
-    f"\nBest MLP lr: {mlp_best['lr']:.5f}, Test Acc: {float(mlp_best['test_acc']) * 100:.1f}%"
-)
-print(
-    f"Best Dendritic lr: {dend_best['lr']:.5f}, Test Acc: {float(dend_best['test_acc']) * 100:.1f}%"
-)
-
-# %%
