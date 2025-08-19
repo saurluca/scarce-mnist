@@ -91,13 +91,16 @@ class LeakyReLU:
 class Sigmoid:
     def __init__(self):
         self.input = None
+        self.output = None
 
     def forward(self, x):
         self.input = x
-        return 1 / (1 + cp.exp(-x))
+        self.output = 1 / (1 + cp.exp(-x))
+        return self.output
 
     def backward(self, grad):
-        return grad * (1 - self.input) * self.input
+        # derivative: s * (1 - s), where s is the sigmoid output
+        return grad * (1 - self.output) * self.output
 
     def __call__(self, x):
         return self.forward(x)
@@ -188,6 +191,37 @@ class Adam:
 
                 # Update parameters
                 param -= self.lr * m_hat / (cp.sqrt(v_hat) + self.eps)
+
+    def __call__(self):
+        return self.step()
+
+
+class SGD:
+    def __init__(self, params, lr=0.01):
+        self.params = params
+        self.lr = lr
+
+    def zero_grad(self):
+        for layer in self.params:
+            if hasattr(layer, "dendrite_W"):
+                layer.dendrite_dW = 0.0
+                layer.dendrite_db = 0.0
+                layer.soma_dW = 0.0
+                layer.soma_db = 0.0
+            else:
+                layer.dW = 0.0
+                layer.db = 0.0
+
+    def step(self):
+        for layer in self.params:
+            if hasattr(layer, "dendrite_W"):
+                layer.dendrite_W -= self.lr * layer.dendrite_dW
+                layer.dendrite_b -= self.lr * layer.dendrite_db
+                layer.soma_W -= self.lr * layer.soma_dW
+                layer.soma_b -= self.lr * layer.soma_db
+            else:
+                layer.W -= self.lr * layer.dW
+                layer.b -= self.lr * layer.db
 
     def __call__(self):
         return self.step()
@@ -550,182 +584,311 @@ def evaluate(
 
 
 # %%
-
-# for repoducability
+# Global config
 cp.random.seed(1287305233)
-
-# data config
-dataset = "mnist"  # "mnist", "fashion-mnist"
-
-# config
-n_epochs = 5  # 15 MNIST, 20 Fashion-MNIST
-lr_1 = 0.001  # 0.002
-lr_2 = 0.001  # 0.002
-batch_size = 32
-
-in_dim = 28 * 28  # Image dimensions (28x28 MNIST)
+dataset = "mnist"  # "mnist" or "fashion-mnist"
+in_dim = 28 * 28
 n_classes = 10
 
-# dendritic model config
-n_dendrite_inputs = 8  # 32 / 16
-n_dendrites = 4  # 23 / 31
-n_neurons = 10  # 10 / 14
+# Fast dev knob (set to an int like 10_000 to speed up runs)
+subset_size = None  # e.g. 10000
 
-# vanilla model config
-hidden_dim = 10  # 10
+# %%
+# Data loading
+X_train, y_train, X_test, y_test = load_mnist_data(
+    dataset=dataset, subset_size=subset_size
+)
 
 
-# Sparse Dendritic Model, 3 layers
-model_1 = Sequential(
-    [
+# %%
+# Helper builders
+def build_activation(name):
+    name = name.lower()
+    if name == "relu":
+        return ReLU()
+    if name == "leakyrelu":
+        return LeakyReLU()
+    if name == "sigmoid":
+        return Sigmoid()
+    raise ValueError(f"Unknown activation '{name}'")
+
+
+def build_mlp(
+    in_features=in_dim,
+    hidden_dim=10,
+    out_dim=n_classes,
+    activation="leakyrelu",
+):
+    return Sequential(
+        [
+            LinearLayer(in_features, hidden_dim),
+            build_activation(activation),
+            LinearLayer(hidden_dim, hidden_dim),
+            build_activation(activation),
+            LinearLayer(hidden_dim, out_dim),
+        ]
+    )
+
+
+def build_dendritic(
+    in_features=in_dim,
+    n_dendrite_inputs=16,
+    n_dendrites=31,
+    n_neurons=10,
+    out_dim=10,
+):
+    # The denrtic layer always has two layers, dendrite and soma. To make the comparison fair we use
+    # three layers for the MLP as well.
+    layers = [
         DendriticLayer(
-            in_dim,
+            in_features,
             n_neurons,
             n_dendrite_inputs=n_dendrite_inputs,
             n_dendrites=n_dendrites,
         ),
-        # LeakyReLU(),
-        # LinearLayer(n_neurons, n_classes),
     ]
+    if out_dim is not None:
+        layers.extend([LeakyReLU(), LinearLayer(n_neurons, out_dim)])
+    return Sequential(layers)
+
+
+# %% [markdown]
+# a) Basic MLP with SGD vs Adam
+
+# %%
+n_epochs = 15
+batch_size = 128
+lr_sgd = 0.001
+lr_adam = 0.001
+
+mlp_sgd = build_mlp(in_dim, 10, n_classes, activation="leakyrelu")
+mlp_adam = build_mlp(in_dim, 10, n_classes, activation="leakyrelu")
+
+
+opt_sgd = SGD(mlp_sgd.params(), lr=lr_sgd)
+opt_adam = Adam(mlp_adam.params(), lr=lr_adam)
+
+print("Training MLP with SGD vs Adam...")
+train_losses_sgd, train_acc_sgd, test_losses_sgd, test_acc_sgd = train(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    mlp_sgd,
+    CrossEntropy(),
+    opt_sgd,
+    n_epochs=n_epochs,
+    batch_size=batch_size,
+)
+train_losses_adam, train_acc_adam, test_losses_adam, test_acc_adam = train(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    mlp_adam,
+    CrossEntropy(),
+    opt_adam,
+    n_epochs=n_epochs,
+    batch_size=batch_size,
 )
 
-# Base MLP model, 3 layers
-model_2 = Sequential(
-    [
-        LinearLayer(in_dim, hidden_dim),
-        LeakyReLU(),
-        LinearLayer(hidden_dim, hidden_dim),
-        LeakyReLU(),
-        LinearLayer(hidden_dim, n_classes),
-    ]
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+plt.plot(train_acc_sgd, label="SGD Train", linestyle="--")
+plt.plot(test_acc_sgd, label="SGD Test")
+plt.plot(train_acc_adam, label="Adam Train", linestyle="--")
+plt.plot(test_acc_adam, label="Adam Test")
+plt.title("Accuracy")
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(train_losses_sgd, label="SGD Train", linestyle="--")
+plt.plot(test_losses_sgd, label="SGD Test")
+plt.plot(train_losses_adam, label="Adam Train", linestyle="--")
+plt.plot(test_losses_adam, label="Adam Test")
+plt.title("Loss")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print(
+    f"Final Acc - SGD Test: {test_acc_sgd[-1] * 100:.1f}% | Adam Test: {test_acc_adam[-1] * 100:.1f}%"
 )
-optimiser_1 = Adam(model_1.params(), lr=lr_1)
-optimiser_2 = Adam(model_2.params(), lr=lr_2)
 
-print(f"number of model_1 params: {model_1.num_params()}")
-print(f"number of model_2 params: {model_2.num_params()}")
+# %% [markdown]
+# b) MLP (28x28, 10, 10) vs Dendritic (16/31/10/10) both having 3 layers and around 8000 parameters in total. 8000 paramters is the smallest sensible MLP.
 
-config = [
-    {
-        "name": "Sparse Dendritic",
-        "model": model_1,
-        "optimiser": optimiser_1,
-        "lr": lr_1,
-    },
-    #     {
-    #         "name": "Base MLP",
-    #         "model": model_2,
-    #         "optimiser": optimiser_2,
-    #         "lr": lr_2,
-    #     },
-]
+# %%
+n_epochs = 8
+batch_size = 128
+lr = 0.001
 
-criterion = CrossEntropy()
+mlp_b = build_mlp(in_dim, 10, n_classes, activation="leakyrelu")
+dend_b = build_dendritic(in_dim, 16, 31, 10, out_dim=10)
 
-# load data
-X_train, y_train, X_test, y_test = load_mnist_data(dataset=dataset)
+print(f"Number of MLP params: {mlp_b.num_params()}")
+print(f"Number of Dendritic params: {dend_b.num_params()}")
 
-# Define colors for plotting
-colors = [
-    "green",
-    "blue",
-    "red",
-    "orange",
-    "purple",
-    "brown",
-    "pink",
-    "gray",
-    "olive",
-    "cyan",
-]
+opt_mlp_b = Adam(mlp_b.params(), lr=lr)
+opt_dend_b = Adam(dend_b.params(), lr=lr)
 
-# Train all models in config
-results = []
-for i, model_config in enumerate(config):
-    model_name = model_config["name"]
-    model = model_config["model"]
-    optimiser = model_config["optimiser"]
+print("Training MLP vs Dendritic...")
+mlp_train_l, mlp_train_a, mlp_test_l, mlp_test_a = train(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    mlp_b,
+    CrossEntropy(),
+    opt_mlp_b,
+    n_epochs=n_epochs,
+    batch_size=batch_size,
+)
+dend_train_l, dend_train_a, dend_test_l, dend_test_a = train(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    dend_b,
+    CrossEntropy(),
+    opt_dend_b,
+    n_epochs=n_epochs,
+    batch_size=batch_size,
+)
 
-    print(f"Training {model_name} model...")
-    train_losses, train_accuracy, test_losses, test_accuracy = train(
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+plt.plot(mlp_train_a, label="MLP Train", linestyle="--")
+plt.plot(mlp_test_a, label="MLP Test")
+plt.plot(dend_train_a, label="Dend Train", linestyle="--")
+plt.plot(dend_test_a, label="Dend Test")
+plt.title("Accuracy")
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(mlp_train_l, label="MLP Train", linestyle="--")
+plt.plot(mlp_test_l, label="MLP Test")
+plt.plot(dend_train_l, label="Dend Train", linestyle="--")
+plt.plot(dend_test_l, label="Dend Test")
+plt.title("Loss")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print(
+    f"Final Acc - MLP Test: {mlp_test_a[-1] * 100:.1f}% | Dend Test: {dend_test_a[-1] * 100:.1f}%"
+)
+
+# %% [markdown]
+# c) Activation comparison: ReLU vs LeakyReLU vs Sigmoid (MLP 28x28-10-10)
+
+# %%
+n_epochs = 15
+batch_size = 128
+lr = 0.001
+
+activations = ["relu", "leakyrelu", "sigmoid"]
+histories = {}
+for act in activations:
+    model = build_mlp(in_dim, 10, n_classes, activation=act)
+    opt = Adam(model.params(), lr=lr)
+    tr_l, tr_a, te_l, te_a = train(
         X_train,
         y_train,
         X_test,
         y_test,
         model,
-        criterion,
-        optimiser,
-        n_epochs,
-        batch_size,
+        CrossEntropy(),
+        opt,
+        n_epochs=n_epochs,
+        batch_size=batch_size,
     )
+    histories[act] = (tr_l, tr_a, te_l, te_a)
 
-    # Store results
-    results.append(
-        {
-            "name": model_name,
-            "train_losses": train_losses,
-            "train_accuracy": train_accuracy,
-            "test_losses": test_losses,
-            "test_accuracy": test_accuracy,
-            "color": colors[i % len(colors)],
-        }
-    )
-
-    print(f"Train accuracy {model_name}: {round(train_accuracy[-1] * 100, 1)}%")
-    print(f"Test accuracy {model_name}: {round(test_accuracy[-1] * 100, 1)}%")
-    print(f"Final train loss {model_name}: {round(train_losses[-1], 4)}")
-    print(f"Final test loss {model_name}: {round(test_losses[-1], 4)}")
-    print("-" * 50)
-
-# Plot accuracy comparison
-plt.figure(figsize=(12, 5))
+plt.figure(figsize=(10, 4))
 plt.subplot(1, 2, 1)
-for result in results:
-    plt.plot(
-        result["train_accuracy"],
-        label=f"{result['name']} Train",
-        color=result["color"],
-        linestyle="--",
-    )
-    plt.plot(
-        result["test_accuracy"], label=f"{result['name']} Test", color=result["color"]
-    )
-plt.title("Accuracy over epochs")
-plt.xlabel("Epoch")
-plt.ylabel("Accuracy")
+for act in activations:
+    plt.plot(histories[act][1], label=f"{act} Train", linestyle="--")
+    plt.plot(histories[act][3], label=f"{act} Test")
+plt.title("Accuracy by Activation")
 plt.legend()
 plt.grid(True, alpha=0.3)
 
-# Plot loss comparison
 plt.subplot(1, 2, 2)
-for result in results:
-    plt.plot(
-        result["train_losses"],
-        label=f"{result['name']} Train",
-        color=result["color"],
-        linestyle="--",
-    )
-    plt.plot(
-        result["test_losses"], label=f"{result['name']} Test", color=result["color"]
-    )
-plt.title("Loss over epochs")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
+for act in activations:
+    plt.plot(histories[act][0], label=f"{act} Train", linestyle="--")
+    plt.plot(histories[act][2], label=f"{act} Test")
+plt.title("Loss by Activation")
 plt.legend()
 plt.grid(True, alpha=0.3)
-
 plt.tight_layout()
 plt.show()
 
-# Print final comparison summary
-print("\n" + "=" * 60)
-print("FINAL RESULTS COMPARISON")
-print("=" * 60)
-for result in results:
-    print(
-        f"{result['name']:20} | Train Acc: {result['train_accuracy'][-1] * 100:5.1f}% | "
-        f"Test Acc: {result['test_accuracy'][-1] * 100:5.1f}% | "
-        f"Train Loss: {result['train_losses'][-1]:6.4f} | "
-        f"Test Loss: {result['test_losses'][-1]:6.4f}"
-    )
-print("=" * 60)
+for act in activations:
+    print(f"{act:10} | Test Acc: {histories[act][3][-1] * 100:.1f}%")
+
+# %% [markdown]
+# d) Grid search: Adam learning rate (batch_size=128, epochs=20)
+
+# %%
+batch_size = 128
+grid_epochs = 20
+lr_grid = [5e-4, 1e-3, 2e-3, 5e-3]
+
+
+def grid_search_model(build_fn, lr_list):
+    results = []
+    for lr in lr_list:
+        model = build_fn()
+        opt = Adam(model.params(), lr=lr)
+        tr_l, tr_a, te_l, te_a = train(
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            model,
+            CrossEntropy(),
+            opt,
+            n_epochs=grid_epochs,
+            batch_size=batch_size,
+        )
+        results.append({"lr": lr, "test_acc": te_a[-1], "test_loss": te_l[-1]})
+    # Pick best by highest test_acc, tie-breaker lowest loss
+    best = sorted(
+        results, key=lambda r: (-float(r["test_acc"]), float(r["test_loss"]))
+    )[0]
+    return results, best
+
+
+print("Grid search on MLP...")
+mlp_results, mlp_best = grid_search_model(
+    lambda: build_mlp(in_dim, 10, n_classes, activation="leakyrelu"), lr_grid
+)
+print("Grid search on Dendritic...")
+dend_results, dend_best = grid_search_model(
+    lambda: build_dendritic(in_dim, 16, 31, 4, out_dim=10), lr_grid
+)
+
+
+def pretty_print(results, name):
+    print(f"\n{name} results (Adam, epochs={grid_epochs}, bs={batch_size})")
+    for r in results:
+        print(
+            f"lr={r['lr']:.5f} | test_acc={float(r['test_acc']) * 100:5.1f}% | test_loss={float(r['test_loss']):.4f}"
+        )
+
+
+pretty_print(mlp_results, "MLP")
+pretty_print(dend_results, "Dendritic")
+print(
+    f"\nBest MLP lr: {mlp_best['lr']:.5f}, Test Acc: {float(mlp_best['test_acc']) * 100:.1f}%"
+)
+print(
+    f"Best Dendritic lr: {dend_best['lr']:.5f}, Test Acc: {float(dend_best['test_acc']) * 100:.1f}%"
+)
+
+# %%
